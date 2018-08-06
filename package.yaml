@@ -29,6 +29,9 @@ dependencies:
 - transformers
 - aeson
 - pointedlist
+- MonadRandom
+- random-shuffle
+- random
 
 library:
   source-dirs: src

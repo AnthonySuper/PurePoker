@@ -17,11 +17,14 @@ module Game.PokerPlayer where
     import Data.List.Lens
     import Control.Monad
     import Data.List (sort)
+    import System.Random (StdGen, mkStdGen)
+    import System.Random.Shuffle
+    import Control.Monad.Trans.Random.Strict 
+    import Control.Monad.Random.Class
     import Control.Monad.State.Strict
     import Control.Monad.Except 
     import Data.Foldable (toList)
     import Data.Maybe (fromJust)
-
     type PlayerId = T.Text
 
     data Player
@@ -70,24 +73,32 @@ module Game.PokerPlayer where
         | EmptyDeck
         | BadDeal
         | PlayerExists PlayerId
+        | ImpossibleState
+        | AllFold
         deriving (Eq, Show, Generic)
 
     instance ToJSON PokerError 
     instance FromJSON PokerError 
 
+    currentPlayer = pokerGamePlayers . PL.focus
+
     newtype GameState m a = GameState {
-        runGameStatea :: StateT PokerGame (ExceptT PokerError m) a
+        runGameStatea :: StateT PokerGame (RandT StdGen (ExceptT PokerError m)) a
     } deriving ( Functor
                , Applicative 
                , Monad 
                , MonadIO
                , MonadState PokerGame 
-               , MonadError PokerError)
+               , MonadError PokerError
+               , MonadRandom
+               , MonadFix)
 
-    runGameState :: GameState m a -> PokerGame -> m (Either PokerError (a, PokerGame))
-    runGameState g initState = runExceptT $ runStateT (runGameStatea g) initState
 
-    runGameStateState g i = (fmap . fmap) snd (runGameState g i) 
+    runGameState :: (Monad m) => GameState m a -> PokerGame -> Int -> m (Either PokerError (a, PokerGame))
+    runGameState g initState seed = runExceptT $ evalRandT stated (mkStdGen seed)
+        where stated = runStateT (runGameStatea g) initState
+
+    runGameStateState g i s = (fmap . fmap) snd (runGameState g i s)
 
     createPlayer :: Integer -> PlayerId -> Player
     createPlayer ss id
@@ -107,7 +118,7 @@ module Game.PokerPlayer where
                   , _pokerGameSmallBlind = sb 
                   , _pokerGameAnte = ant
                   }
-    
+
     orError :: (MonadError e m) => e -> Maybe a -> m a 
     orError e (Just x) = pure x
     orError e Nothing = throwError e 
@@ -126,17 +137,30 @@ module Game.PokerPlayer where
         then throwError $ PlayerExists (p ^. playerId)
         else pure $ over pokerGamePlayers (PL.insert p) g
 
+    shuffleDeck = do
+        s <- get
+        n <- shuffleM $ s ^. pokerGameDeck 
+        pokerGameDeck Control.Lens..= n
+
     dealCommunityCard = dealCard pokerGameCommunityCards
 
-    dealCurrentPlayer sel = dealCard $ pokerGamePlayers . PL.focus . sel
+    dealCurrentPlayer sel = dealCard $ currentPlayer . sel
+
+    dealCurrentHole = dealCurrentPlayer playerHoleCards 
+
+    dealCurrentVisible = dealCurrentPlayer playerVisibleCards
 
     shiftCurrent = pokerGamePlayers %~ PL.next
 
+    allFolded g = length foldList < 2 
+        where
+            foldList = filter (^. playerFolded) (toList $ g ^. pokerGamePlayers)
+
+    
     dealAllIf sel filt = do 
         g <- get 
         replicateM_ (PL.length $ g ^. pokerGamePlayers) (dealIf >> modify shiftCurrent)
         where
-            dealIf :: (Monad m) => GameState m ()
             dealIf = do
                 g <- get 
                 if filt $ g ^. pokerGamePlayers . PL.focus then do
@@ -144,13 +168,9 @@ module Game.PokerPlayer where
                     put ng 
                 else pure ()
     
-    
     stripPrivateExcept :: PlayerId -> PokerGame -> PokerGame
     stripPrivateExcept i = pokerGamePlayers %~ stripMap
         where
             stripMap = fmap stripIfNot
             stripIfNot p = if p ^. playerId == i then p else stripPrivate p
             stripPrivate = playerHoleCards .~ []
-    
-    class PokerGameEvent evt where 
-        handleEvent :: evt -> PokerGame -> Maybe PokerGame
